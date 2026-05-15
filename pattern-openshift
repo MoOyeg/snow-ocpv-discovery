@@ -1,0 +1,485 @@
+// Discovery Pattern: OpenShift Virtual Machines
+//
+// One CI per KubeVirt VirtualMachine, written to
+// u_cmdb_ci_openshift_virtual_machines. Pods, nodes, namespaces, and
+// kubernetes-native CIs are not created. Mirrors §6.3-§6.5 of
+// servicenow-australia-ocpv-inventory.md.
+//
+// Note: All §5.1 custom columns are prefixed with u_ in Australia (a
+// system-wide enforcement that applies to columns as well as tables,
+// regardless of scope). Inherited base-class fields (name,
+// correlation_id, cpus, memory, ip_address, os) stay unprefixed.
+//
+// Inputs (set as Pattern Attributes on the Discovery Schedule's
+// execution-pattern record — see §7.3 of the runbook):
+//   url           e.g. https://kubernetes.default.svc  (must include scheme)
+//   cluster_name  free-text identifier, e.g. ocp-prod-1
+//
+// Bearer token: this pattern targets the in-cluster MID path and resolves
+// the pod-mounted SA token at
+// /var/run/secrets/kubernetes.io/serviceaccount/token.
+//
+// Import / update: this file targets the existing on-instance pattern
+// `openshift_virtual_machine` (sa_pattern sys_id 5961b2f993300710d38ffc20ed03d6c7).
+// To deploy: PATCH /api/now/table/sa_pattern/5961b2f993300710d38ffc20ed03d6c7
+// with body {"ndl": <contents of this file>}. metadata.id below MUST equal
+// the sa_pattern sys_id — keep them in sync if you ever rename.
+
+pattern {
+	metadata {
+		id = "5961b2f993300710d38ffc20ed03d6c7"
+		name = "OpenShift Virtual Machines"
+			description = "Discover OpenShift Virtualization (KubeVirt) VirtualMachines as u_cmdb_ci_openshift_virtual_machines CIs. Fetches /apis/kubevirt.io/v1/virtualmachines and /apis/kubevirt.io/v1/virtualmachineinstances, joins on the parent VM UID, populates one CI per VM. Stopped VMs (no live VMI) are kept with empty runtime fields."
+			citype = "u_cmdb_ci_openshift_virtual_machines"
+		apply_to_os_families = "ALL"
+		apply_to_os_types = "ALL"
+	}
+	identification {
+		name = "primary"
+		entry_point {type = "*"}
+		find_process_strategy {strategy = NONE}
+
+		step {
+			name = "Resolve bearer token from MID pod's mounted SA token (in-cluster MID)"
+			if {
+				condition = is_empty {get_attr {"k8s_token"}}
+				on_true = set_attr {
+					"k8s_token"
+					eval {"javascript:
+var File = Packages.java.io.File;
+var Scanner = Packages.java.util.Scanner;
+var tokenFile = new File('/var/run/secrets/kubernetes.io/serviceaccount/token');
+var rtrn = '';
+if (tokenFile.exists()) {
+  var sc = new Scanner(tokenFile);
+  sc.useDelimiter('\\\\Z');
+  if (sc.hasNext()) rtrn = String(sc.next()).trim();
+  sc.close();
+}
+rtrn"}
+				}
+				on_false = nop {}
+			}
+		}
+
+		step {
+			name = "Verify token is set"
+			set_attr {
+				"token_check"
+				eval {"javascript:
+var token = CTX.getAttribute('k8s_token');
+if (!token) {
+  throw 'No bearer token. This pattern targets the in-cluster MID path; set serviceAccountName: snow-discovery on the Deployment so /var/run/secrets/kubernetes.io/serviceaccount/token is mounted.';
+}
+'success'"}
+			}
+		}
+
+		step {
+			name = "Fetch VirtualMachines list"
+			set_attr {
+				"vm_list_response"
+				eval {"javascript:
+	var httpCall = Packages.com.snc.sw.commands.HttpCallHandler;
+	var httpClient = new httpCall();
+	var ciType = CTX.getAttribute('pattern_cit_id');
+	var url = CTX.getAttribute('url');
+	var token = CTX.getAttribute('k8s_token');
+	var endpoint = url + '/apis/kubevirt.io/v1/virtualmachines';
+	var header = 'Authorization: Bearer ' + token;
+	var response;
+	try {
+	  response = httpClient.invoke(CTX, endpoint, 'GET', null, null, ciType, header, 'false');
+	} catch (e) {
+	  throw 'HttpCallHandler threw on GET virtualmachines: ' + e + ' (endpoint=' + endpoint + ', token_length=' + String(token || '').length + '). Likely TLS trust against the OCP service CA — import it into the MID JVM cacerts and restart the MID pod.';
+	}
+	if (!response) {
+	  throw 'HttpCallHandler returned null/empty on GET virtualmachines — no HTTP response received. endpoint=' + endpoint + ', token_length=' + String(token || '').length + '. Do not rerun Pattern Debug until mid_kubevirt_preflight.sh shows truststore alias openshift-service-ca, HTTP_STATUS=200, and JAVA_HTTP_STATUS=200 for /apis/kubevirt.io/v1/virtualmachines.';
+	}
+	response"}
+			}
+		}
+
+		step {
+			name = "Verify VM list response is non-empty"
+			set_attr {
+				"vm_list_check"
+				eval {"javascript:
+var resp = CTX.getAttribute('vm_list_response');
+if (!resp) {
+  throw 'Empty response from /apis/kubevirt.io/v1/virtualmachines. Check: KubeVirt operator installed (404 = no operator), SA has kubevirt.io:view ClusterRoleBinding (403 = missing RBAC), url pattern attribute includes https:// scheme.';
+}
+'success'"}
+			}
+		}
+
+		step {
+			name = "Parse VirtualMachines into tmp_kubevirt_vms"
+			set_attr {
+				"tmp"
+				eval {"javascript:
+	var resp = CTX.getAttribute('vm_list_response');
+	function parseJsonBody(raw, label) {
+	  var text = String(raw || '');
+	  var objectStart = text.indexOf('{');
+	  var arrayStart = text.indexOf('[');
+	  var start = -1;
+	  if (objectStart >= 0 && arrayStart >= 0) start = Math.min(objectStart, arrayStart);
+	  else if (objectStart >= 0) start = objectStart;
+	  else start = arrayStart;
+	  var end = Math.max(text.lastIndexOf('}'), text.lastIndexOf(']'));
+	  if (start < 0 || end < start) {
+	    throw label + ' response did not contain a JSON body. First 200 chars: ' + text.substring(0, 200);
+	  }
+	  text = text.substring(start, end + 1);
+	  try {
+	    return JSON.parse(text);
+	  } catch (e) {
+	    throw label + ' JSON parse failed: ' + e + '. First 200 chars: ' + text.substring(0, 200);
+	  }
+	}
+	var data = parseJsonBody(resp, 'VirtualMachines list');
+	var rows = new Packages.java.util.ArrayList();
+var items = (data && data.items) ? data.items : [];
+for (var i = 0; i < items.length; i++) {
+  var vm = items[i];
+  var spec = (vm.spec && vm.spec.template && vm.spec.template.spec && vm.spec.template.spec.domain) ? vm.spec.template.spec.domain : {};
+  var cpu = spec.cpu || {};
+  var mem = (spec.memory && spec.memory.guest) ? spec.memory.guest : '';
+  var machine = (spec.machine && spec.machine.type) ? spec.machine.type : '';
+  var fw = spec.firmware || {};
+  var bootloader = fw.bootloader || null;
+  var firmware;
+  if (!bootloader) firmware = 'BIOS';
+  else if (bootloader.efi && bootloader.efi.secureBoot === true) firmware = 'UEFI-SecureBoot';
+  else firmware = 'UEFI';
+  var sockets = cpu.sockets || 1;
+  var cores = cpu.cores || 1;
+  var threads = cpu.threads || 1;
+
+  var row = new Packages.java.util.HashMap();
+  row.put('name', vm.metadata.name);
+  row.put('namespace_name', vm.metadata.namespace);
+  row.put('vm_uid', vm.metadata.uid);
+  row.put('run_strategy', vm.spec.runStrategy || '');
+  row.put('printable_status', (vm.status && vm.status.printableStatus) ? vm.status.printableStatus : '');
+  row.put('vcpu_sockets', String(sockets));
+  row.put('vcpu_cores', String(cores));
+  row.put('vcpu_threads', String(threads));
+  row.put('cpus', String(sockets * cores * threads));
+  row.put('memory_raw', mem);
+  row.put('machine_type', machine);
+  row.put('firmware', firmware);
+  rows.add(row);
+}
+CTX.setAttribute('tmp_kubevirt_vms', rows);
+'success'"}
+			}
+		}
+
+		step {
+			name = "Verify at least one VM was parsed"
+			set_attr {
+				"vm_parse_check"
+				eval {"javascript:
+var rows = CTX.getAttribute('tmp_kubevirt_vms');
+if (!rows || rows.size() == 0) {
+  throw '0 VirtualMachines returned. Either no VMs exist on the cluster, or the SA cannot list them in the namespaces that have any.';
+}
+'success'"}
+			}
+		}
+
+		step {
+			name = "Fetch VirtualMachineInstances list (runtime state)"
+			set_attr {
+				"vmi_list_response"
+				eval {"javascript:
+	var httpCall = Packages.com.snc.sw.commands.HttpCallHandler;
+	var httpClient = new httpCall();
+	var ciType = CTX.getAttribute('pattern_cit_id');
+	var url = CTX.getAttribute('url');
+	var token = CTX.getAttribute('k8s_token');
+	var endpoint = url + '/apis/kubevirt.io/v1/virtualmachineinstances';
+	var header = 'Authorization: Bearer ' + token;
+	var response;
+	try {
+	  response = httpClient.invoke(CTX, endpoint, 'GET', null, null, ciType, header, 'false');
+	} catch (e) {
+	  throw 'HttpCallHandler threw on GET virtualmachineinstances: ' + e + ' (endpoint=' + endpoint + '). Likely TLS trust against the OCP service CA — import it into the MID JVM cacerts and restart the MID pod.';
+	}
+	response || ''"}
+			}
+		}
+
+		step {
+			name = "Parse VMIs into tmp_kubevirt_vmis (keyed by parent VM UID)"
+			set_attr {
+				"tmp"
+				eval {"javascript:
+	var resp = CTX.getAttribute('vmi_list_response');
+	var rows = new Packages.java.util.ArrayList();
+	if (resp) {
+	  function parseJsonBody(raw) {
+	    var text = String(raw || '');
+	    var objectStart = text.indexOf('{');
+	    var arrayStart = text.indexOf('[');
+	    var start = -1;
+	    if (objectStart >= 0 && arrayStart >= 0) start = Math.min(objectStart, arrayStart);
+	    else if (objectStart >= 0) start = objectStart;
+	    else start = arrayStart;
+	    var end = Math.max(text.lastIndexOf('}'), text.lastIndexOf(']'));
+	    if (start < 0 || end < start) return {items: []};
+	    return JSON.parse(text.substring(start, end + 1));
+	  }
+	  var data = parseJsonBody(resp);
+	  var items = (data && data.items) ? data.items : [];
+  for (var i = 0; i < items.length; i++) {
+    var vmi = items[i];
+    var owner = (vmi.metadata && vmi.metadata.ownerReferences && vmi.metadata.ownerReferences[0]) ? vmi.metadata.ownerReferences[0] : {};
+    var ifaces = (vmi.status && vmi.status.interfaces) ? vmi.status.interfaces : [];
+    var guest = (vmi.status && vmi.status.guestOSInfo) ? vmi.status.guestOSInfo : {};
+
+    var row = new Packages.java.util.HashMap();
+	    row.put('vm_uid', owner.uid || '');
+	    row.put('vmi_uid', (vmi.metadata && vmi.metadata.uid) ? vmi.metadata.uid : '');
+	    row.put('node_name', (vmi.status && vmi.status.nodeName) ? vmi.status.nodeName : '');
+	    row.put('ip_address', (ifaces[0] && ifaces[0].ipAddress) ? ifaces[0].ipAddress : '');
+	    row.put('guest_os_id', guest.id || '');
+    row.put('guest_os_name', guest.name || '');
+    row.put('guest_os_version', guest.version || '');
+    rows.add(row);
+  }
+}
+CTX.setAttribute('tmp_kubevirt_vmis', rows);
+'success'"}
+			}
+			}
+
+			step {
+				name = "Fetch virt-launcher Pods list (optional pod context)"
+				set_attr {
+					"pod_list_response"
+					eval {"javascript:
+	var httpCall = Packages.com.snc.sw.commands.HttpCallHandler;
+	var httpClient = new httpCall();
+	var ciType = CTX.getAttribute('pattern_cit_id');
+	var url = CTX.getAttribute('url');
+	var token = CTX.getAttribute('k8s_token');
+	var endpoint = url + '/api/v1/pods?labelSelector=kubevirt.io%3Dvirt-launcher';
+	var response = '';
+	var header = 'Authorization: Bearer ' + token;
+	try {
+	  response = httpClient.invoke(CTX, endpoint, 'GET', null, null, ciType, header, 'false');
+	} catch (e) {
+	  response = '';
+	}
+	response || ''"}
+				}
+			}
+
+			step {
+				name = "Parse virt-launcher Pods into tmp_virt_launcher_pods (keyed by VMI UID)"
+				set_attr {
+					"tmp"
+					eval {"javascript:
+	var resp = CTX.getAttribute('pod_list_response');
+	var rows = new Packages.java.util.ArrayList();
+	if (resp) {
+	  function parseJsonBody(raw) {
+	    var text = String(raw || '');
+	    var objectStart = text.indexOf('{');
+	    var arrayStart = text.indexOf('[');
+	    var start = -1;
+	    if (objectStart >= 0 && arrayStart >= 0) start = Math.min(objectStart, arrayStart);
+	    else if (objectStart >= 0) start = objectStart;
+	    else start = arrayStart;
+	    var end = Math.max(text.lastIndexOf('}'), text.lastIndexOf(']'));
+	    if (start < 0 || end < start) return {items: []};
+	    return JSON.parse(text.substring(start, end + 1));
+	  }
+	  var data = parseJsonBody(resp);
+	  var items = (data && data.items) ? data.items : [];
+	  for (var i = 0; i < items.length; i++) {
+	    var pod = items[i];
+	    var labels = (pod.metadata && pod.metadata.labels) ? pod.metadata.labels : {};
+	    var row = new Packages.java.util.HashMap();
+	    row.put('vmi_uid', labels['kubevirt.io/created-by'] || '');
+	    row.put('virt_launcher_pod_name', pod.metadata.name || '');
+	    rows.add(row);
+	  }
+	}
+	CTX.setAttribute('tmp_virt_launcher_pods', rows);
+	'success'"}
+				}
+			}
+
+			step {
+				name = "Merge VM + VMI rows into tmp_merged (LEFT join on vm_uid; keeps stopped VMs)"
+				set_attr {
+					"tmp"
+					eval {"javascript:
+	var vms = CTX.getAttribute('tmp_kubevirt_vms');
+	var vmis = CTX.getAttribute('tmp_kubevirt_vmis');
+	var pods = CTX.getAttribute('tmp_virt_launcher_pods');
+	if (!vms || vms.size() == 0) {
+	  throw 'No parsed VirtualMachine rows are available for merge. Check the Parse VirtualMachines step and vm_list_response.';
+	}
+	var vmiByUid = {};
+	if (vmis) {
+	  for (var j = 0; j < vmis.size(); j++) {
+	    var v = vmis.get(j);
+	    vmiByUid[v.get('vm_uid')] = v;
+	  }
+	}
+	var podByVmiUid = {};
+	if (pods) {
+	  for (var p = 0; p < pods.size(); p++) {
+	    var pod = pods.get(p);
+	    podByVmiUid[pod.get('vmi_uid')] = pod;
+	  }
+	}
+	var merged = new Packages.java.util.ArrayList();
+	for (var i = 0; i < vms.size(); i++) {
+	  var vm = vms.get(i);
+	  var vmi = vmiByUid[vm.get('vm_uid')] || null;
+	  var pod = vmi ? (podByVmiUid[vmi.get('vmi_uid')] || null) : null;
+	  var row = new Packages.java.util.HashMap();
+	  var keys = vm.keySet().toArray();
+	  for (var k = 0; k < keys.length; k++) row.put(keys[k], vm.get(keys[k]));
+	  if (vmi) {
+	    row.put('node_name', vmi.get('node_name'));
+	    row.put('virt_launcher_pod_name', pod ? pod.get('virt_launcher_pod_name') : '');
+	    row.put('ip_address', vmi.get('ip_address'));
+	    row.put('guest_os_id', vmi.get('guest_os_id'));
+	    row.put('guest_os_name', vmi.get('guest_os_name'));
+	    row.put('guest_os_version', vmi.get('guest_os_version'));
+	  } else {
+	    row.put('node_name', '');
+	    row.put('virt_launcher_pod_name', '');
+	    row.put('ip_address', '');
+	    row.put('guest_os_id', '');
+	    row.put('guest_os_name', '');
+    row.put('guest_os_version', '');
+  }
+  // Convert memory_raw (Kubernetes resource quantity: 1Gi/2048Mi/4096M/etc) to MB
+  var raw = String(vm.get('memory_raw') || '');
+  var mb = '';
+  if (raw) {
+    var m = raw.match(/^(\\d+)([KMGT]i?)?$/);
+    if (m) {
+      var n = parseInt(m[1], 10);
+      switch (String(m[2] || '')) {
+        case 'Gi': mb = n * 1024; break;
+        case 'Mi': mb = n; break;
+        case 'Ki': mb = Math.floor(n / 1024); break;
+        case 'G':  mb = n * 1000; break;
+        case 'M':  mb = n; break;
+        case 'K':  mb = Math.floor(n / 1000); break;
+        default:   mb = Math.floor(n / 1048576); break; // bytes
+      }
+    }
+  }
+  row.put('memory', String(mb));
+  merged.add(row);
+}
+CTX.setAttribute('tmp_merged', merged);
+'success'"}
+			}
+		}
+
+		step {
+				name = "Populate u_cmdb_ci_openshift_virtual_machines"
+				transform {
+					src_table_name = "tmp_merged"
+					target_table_name = "u_cmdb_ci_openshift_virtual_machines"
+				operation {
+					set_field {
+						field_name = "name"
+						value = get_attr {"tmp_merged[].name"}
+					}
+					set_field {
+						field_name = "correlation_id"
+						value = get_attr {"tmp_merged[].vm_uid"}
+					}
+					set_field {
+						field_name = "u_vm_uid"
+						value = get_attr {"tmp_merged[].vm_uid"}
+					}
+					set_field {
+						field_name = "u_cluster_name"
+						value = get_attr {"cluster_name"}
+					}
+					set_field {
+						field_name = "u_cluster_url"
+						value = get_attr {"url"}
+					}
+					set_field {
+						field_name = "u_namespace_name"
+						value = get_attr {"tmp_merged[].namespace_name"}
+					}
+						set_field {
+							field_name = "u_node_name"
+							value = get_attr {"tmp_merged[].node_name"}
+						}
+						set_field {
+							field_name = "u_virt_launcher_pod_name"
+							value = get_attr {"tmp_merged[].virt_launcher_pod_name"}
+						}
+						set_field {
+							field_name = "u_run_strategy"
+							value = get_attr {"tmp_merged[].run_strategy"}
+					}
+					set_field {
+						field_name = "u_printable_status"
+						value = get_attr {"tmp_merged[].printable_status"}
+					}
+					set_field {
+						field_name = "u_machine_type"
+						value = get_attr {"tmp_merged[].machine_type"}
+					}
+					set_field {
+						field_name = "u_firmware"
+						value = get_attr {"tmp_merged[].firmware"}
+					}
+					set_field {
+						field_name = "u_vcpu_sockets"
+						value = get_attr {"tmp_merged[].vcpu_sockets"}
+					}
+					set_field {
+						field_name = "u_vcpu_cores"
+						value = get_attr {"tmp_merged[].vcpu_cores"}
+					}
+					set_field {
+						field_name = "u_vcpu_threads"
+						value = get_attr {"tmp_merged[].vcpu_threads"}
+					}
+					set_field {
+						field_name = "cpus"
+						value = get_attr {"tmp_merged[].cpus"}
+					}
+					set_field {
+						field_name = "memory"
+						value = get_attr {"tmp_merged[].memory"}
+					}
+					set_field {
+						field_name = "u_guest_os_name"
+						value = get_attr {"tmp_merged[].guest_os_name"}
+					}
+					set_field {
+						field_name = "u_guest_os_version"
+						value = get_attr {"tmp_merged[].guest_os_version"}
+					}
+					set_field {
+						field_name = "os"
+						value = get_attr {"tmp_merged[].guest_os_id"}
+					}
+					set_field {
+						field_name = "ip_address"
+						value = get_attr {"tmp_merged[].ip_address"}
+					}
+				}
+			}
+		}
+	}
+}

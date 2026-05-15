@@ -1,0 +1,396 @@
+pattern {
+	metadata {
+		id = "d9c2d234c3c9f150a2b1e92bb0013193"
+		name = "OpenStack - Discover Service Accounts"
+		description = ""
+		citype = "cmdb_ci_cloud_service_account"
+	}
+	identification {
+		name = "OpenStack Discover Service Accounts"
+		entry_point {type = "*"}
+		find_process_strategy {strategy = NONE}
+		step {
+			name = "Create service account table if doesn't exist"
+			if {
+				condition = is_empty {get_attr {"service_account"}}
+				on_true = parse_var_to_var {
+					from_var_name = "cloud_datacenter_type"
+					to_var_names = table {
+						name = "service_account"
+						col_names = "datacenter_type"
+					}
+					parsing_strategy = delimited_parsing {
+						selected_positions = 1
+					}
+					if_not_found_do = nop {}
+				}
+				on_false = nop {}
+			}
+		}
+		step {
+			name = "Add credentials and account ID to service account table if don't exist"
+			if {
+				condition = all {
+					is_empty {get_attr {"service_account[1].discovery_credentials"}}
+					is_empty {get_attr {"service_account[1].account_id"}}
+				}
+				on_true = transform {
+					src_table_name = "service_account"
+					target_table_name = "service_account"
+					operation {
+						set_field {
+							field_name = "account_id"
+							value = get_attr {"cloud_account_id"}
+						}
+						set_field {
+							field_name = "object_id"
+							value = get_attr {"cloud_account_id"}
+						}
+						set_field {
+							field_name = "discovery_credentials"
+							value = get_attr {"cloud_cred_id"}
+						}
+						set_field {
+							field_name = "datacenter_url"
+							value = get_attr {"datacenter_url"}
+						}
+					}
+				}
+				on_false = nop {}
+			}
+		}
+		step {
+			name = "Failover: Add credentials and account ID to service account table if don't exist"
+			if {
+				condition = all {
+					is_empty {get_attr {"service_account[1].discovery_credentials"}}
+					is_empty {get_attr {"service_account[1].account_id"}}
+					is_empty {get_attr {"datacenter_url"}}
+				}
+				on_true = transform {
+					src_table_name = "service_account"
+					target_table_name = "service_account"
+					operation {
+						set_field {
+							field_name = "account_id"
+							value = get_attr {"cloud_account_id"}
+						}
+						set_field {
+							field_name = "object_id"
+							value = get_attr {"cloud_account_id"}
+						}
+						set_field {
+							field_name = "discovery_credentials"
+							value = get_attr {"cloud_cred_id"}
+						}
+						set_field {
+							field_name = "datacenter_url"
+							value = get_attr {"datacenterUrl"}
+						}
+					}
+				}
+				on_false = nop {}
+			}
+		}
+		step {
+			name = "Set supported version - Keystone"
+			set_attr {
+				"keystone_supported_version"
+				"3"
+			}
+		}
+		step {
+			name = "Get Token and credential details"
+			set_attr {
+				"tmp"
+				eval {"javascript: //Java class loading
+var httpRequest = Packages.com.glide.communications.HTTPRequest;
+var URI = Packages.java.net.URI;
+var uriException = Packages.java.net.URISyntaxException; 
+var rtrn;
+
+//Context loading
+var urlAuth = CTX.getAttribute('service_account[1].datacenter_url');
+var keystone_version =  CTX.getAttribute('keystone_supported_version');
+//var credsAlias = CTX.getAttribute('cloud_cred_alias');
+var cred_id = CTX.getAttribute('service_account[1].discovery_credentials');
+var project_id = CTX.getAttribute('service_account[1].object_id');
+var parameter_domain_id = CTX.getAttribute('cloud_domain_id');
+var token = CTX.getAttribute('token');
+
+var openstack_auth = new OpenstackAuthenticationString();
+var content = openstack_auth.create_string(project_id,cred_id,parameter_domain_id);
+
+if(!token) {
+
+	try{
+		var auth_url = new URI(urlAuth);
+		
+	}catch(err){
+		ms.log(\"Not a valid auth_url. e.g. https://host:port. Current is \" + urlAuth);
+		throw new uriException(err.getMessage(), \"Not a valid auth_url. e.g. https://host:port\");
+	}
+		
+	// Construct auth auth_url 
+  urlAuth = urlAuth + \"/v\" + keystone_version + \"/auth/tokens\" ;
+  CTX.setAttribute(\"endpoint_keystone\",urlAuth);
+
+
+	
+	var httpAuthRequest = new httpRequest(urlAuth);
+	httpAuthRequest.addHeader('Content-Type','application/json');
+	httpAuthRequest.addHeader('Accept','application/json');
+
+	var httpAuthResponse = httpAuthRequest.post(content);
+	
+	rtrn = httpAuthResponse.getHeader('X-Subject-Token');
+  //bellow is added to hide value from discovery log, the it is restored back to default
+  Packages.com.snc.sw.log.DiscoLog.setDisabled(true);
+	CTX.setAttribute(\"token\",rtrn);
+  rtrn = 'success';
+  Packages.com.snc.sw.log.DiscoLog.setDisabled(false);
+
+}
+
+rtrn;"}
+			}
+		}
+		step {
+			name = "Verify token is created"
+			match {
+				is_not_empty {get_attr {"token"}}
+				terminate_op = graceful
+				terminate_msg = "Token creation failed. Please verify that the Cloud Service Account and the Credentials are configured with correct data."
+			}
+		}
+		step {
+			name = "Get OpenStack Project details"
+			set_attr {
+				"projects_list_response"
+				eval {"javascript: 
+//Java class loading
+var logger=Packages.com.snc.sw.log.DiscoLog.getLogger(\"OpenStack Validate Service Account pattern.\");
+var httpCall = Packages.com.snc.sw.commands.HttpCallHandler;
+var httpClientAuth = new httpCall();
+var httpClient = new httpCall();
+var rtrn;
+
+//Context loading
+var ciType = CTX.getAttribute('pattern_cit_id');
+var serviceURL = CTX.getAttribute('service_account[1].datacenter_url');
+var keystone_version = CTX.getAttribute('keystone_supported_version');
+var project_id = CTX.getAttribute('service_account[1].object_id');
+
+var token = CTX.getAttribute('token');
+var resource = \"projects\";
+
+serviceURL = serviceURL + \"/v\" + keystone_version
+
+if (token) {
+   
+   var header = \"X-Auth-Token:\" + token;
+   serviceURL = serviceURL + \"/\" + resource ;
+  try{
+			      var response = httpClient.invoke(CTX, serviceURL, 'GET', null, null, ciType, header, 'false');
+	}
+	catch (e){
+			      logger.error(\">>>>>>>>>>>>>>>>>>>>> generic resource REST request failed. exception=\" + e);
+	}
+	logger.debug(\">>>>>>>>>>>>>>>>>>>>> response from generic resources request=\" + response);
+   
+   rtrn = response;
+}
+rtrn"}
+			}
+		}
+		step {
+			name = "Parse the projects"
+			parse_var_to_var {
+				from_var_name = "projects_list_response"
+				to_var_names = table {
+					name = "projects"
+					col_names = "project_id","project_name","enabled"
+				}
+				parsing_strategy = custom_parsing_strategy {
+					sys_id = "512a3d5a9f3312003cb191aec32e708a"
+					rootXpath = "/root"
+					fields {
+						field {
+							col_name = "project_id"
+							xpath = "/root/projects/id/text()"
+							delimiters = ""
+							position = 1
+						}
+						field {
+							col_name = "project_name"
+							xpath = "/root/projects/name/text()"
+							delimiters = ""
+							position = 1
+						}
+						field {
+							col_name = "enabled"
+							xpath = "/root/projects/enabled/text()"
+							delimiters = ""
+							position = 1
+						}
+						field {
+							col_name = "forEach"
+							for_each = "forEach"
+							delimiters = ""
+							position = 1
+						}
+					}
+				}
+				if_not_found_do = nop {}
+			}
+		}
+		step {
+			name = "Transform the boolean values into string"
+			transform {
+				src_table_name = "projects"
+				target_table_name = "projects"
+				operation {set_field {
+						field_name = "enabled"
+						value = eval {"javascript: var rtn; 
+var enabled = ${projects[].enabled} ? \"true\" : \"false\";
+// projects[].enabled - contains boolean variables
+
+enabled"}
+					}}
+			}
+		}
+		step {
+			name = "Filter only active projects"
+			filter {
+				src_table_name = "projects"
+				target_table_name = "projects"
+				condition = eq {
+					get_attr {"projects[].enabled"}
+					"true"
+				}
+			}
+		}
+		step {
+			name = "Verify if we have any valid response"
+			match {
+				is_not_empty {get_attr {"projects"}}
+				terminate_op = graceful
+				terminate_msg = "No Projects exist or insufficient credential permissions to list the projects."
+			}
+		}
+		step {
+			name = "Populate cmdb_ci_cloud_service_account table"
+			transform {
+				src_table_name = "projects"
+				target_table_name = "cmdb_ci_cloud_service_account"
+				operation {
+					set_field {
+						field_name = "account_id"
+						value = get_attr {"projects[].project_id"}
+					}
+					set_field {
+						field_name = "object_id"
+						value = get_attr {"projects[].project_id"}
+					}
+					set_field {
+						field_name = "name"
+						value = get_attr {"projects[].project_name"}
+					}
+					set_field {
+						field_name = "datacenter_type"
+						value = get_attr {"service_account.datacenter_type"}
+					}
+					set_field {
+						field_name = "discovery_credentials"
+						value = get_attr {"service_account.discovery_credentials"}
+					}
+					set_field {
+						field_name = "datacenter_url"
+						value = get_attr {"service_account.datacenter_url"}
+					}
+				}
+			}
+		}
+		step {
+			name = "Get regions"
+			set_attr {
+				"regions_list_response"
+				eval {"javascript: 
+//Java class loading
+var httpCall = Packages.com.snc.sw.commands.HttpCallHandler;
+var httpClientAuth = new httpCall();
+var httpClient = new httpCall();
+var rtrn;
+
+//Context loading
+var ciType = CTX.getAttribute('pattern_cit_id');
+var serviceURL = CTX.getAttribute('service_account[1].datacenter_url');
+var keystone_version = CTX.getAttribute('keystone_supported_version');
+
+var token = CTX.getAttribute('token');
+var resource = \"regions\";
+
+serviceURL = serviceURL + \"/v\" + keystone_version
+
+if (token) {
+   
+   var header = \"X-Auth-Token:\" + token;
+   serviceURL = serviceURL + \"/\" + resource ;
+   var response = httpClient.invoke(CTX, serviceURL, 'GET', null, null, ciType, header, 'false');
+   rtrn = response;
+}"}
+			}
+		}
+		step {
+			name = "Parse regions"
+			if {
+				condition = is_not_empty {get_attr {"regions_list_response"}}
+				on_true = set_attr {
+					"tmp"
+					eval {"javascript: var rtrn = '';
+var regions = JSON.parse(${regions_list_response}).regions;//.regions;
+var service_accounts = ${cmdb_ci_cloud_service_account};
+var ldc_table = new Packages.java.util.ArrayList();
+var row = Packages.java.util.HashMap;
+if (Array.isArray(regions)) {
+   for (var i = 0; i < service_accounts.size(); i++){
+      var service_account = service_accounts.get(i);
+      
+      for (j = 0; j < regions.length; j++) {
+         var ldc = regions[j].id;
+         var ldc_rec =  new row();
+         ldc_rec.put('object_id', ldc);
+         ldc_rec.put('name', ldc);
+         ldc_rec.put('region', ldc);
+         ldc_rec.put('project_id',service_account.get('account_id'));
+         ldc_table.add(ldc_rec);
+      }
+   }
+}
+CTX.setAttribute('cmdb_ci_openstack_datacenter', ldc_table);
+
+"}
+				}
+				on_false = nop {}
+			}
+		}
+		step {
+			name = "Create relationship between cmdb_ci_openstack_datacenter and $cmdb_ci_cloud_service_account"
+			if {
+				condition = is_not_empty {get_attr {"cmdb_ci_openstack_datacenter[1].object_id"}}
+				on_true = relation_reference {
+					table1_name = "cmdb_ci_openstack_datacenter"
+					key1_name = "project_id"
+					table2_name = "cmdb_ci_cloud_service_account"
+					key2_name = "object_id"
+					result_table_name = "account_to_ldc"
+					unmatched_lines = remove
+					relation_type = "Hosted on::Hosts"
+					ref_direction = parentToChild
+					ref_field_name = ""
+				}
+				on_false = nop {}
+			}
+		}
+	}
+}

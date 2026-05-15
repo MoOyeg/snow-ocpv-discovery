@@ -1,0 +1,32 @@
+# --- Secrets / credentials (never commit) ---
+.env
+mid-secrets.properties
+miduser
+snow-discovery.token
+*.token
+kubeconfig
+*.kubeconfig
+
+# --- Cluster-specific runtime artifacts (generated per-cluster, see blog §6) ---
+ocp-api-ca.crt
+ocp-kubernetes-service-ca.pem
+ocp-kubernetes-service-ca-selected.pem
+*.pem
+*.crt
+
+# --- ServiceNow proprietary MID recipe content (downloaded by the reader, not redistributable) ---
+# The reader fetches the signed recipe ZIP from ServiceNow per blog §3.1.
+*.zip
+mid-linux-container-recipe.*
+EULA*.pdf
+META-INF/
+asset/mid.*.zip
+# Stock recipe asset scripts ship inside ServiceNow's recipe ZIP; keep only our own hook.
+asset/*
+!asset/import_ocp_service_ca.sh
+containerfile
+
+# --- OS / editor junk ---
+.DS_Store
+*.swp
+*~
