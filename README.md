@@ -12,6 +12,10 @@ container recipe (Dockerfile recipe, stock `asset/` scripts, `META-INF/`
 signature, EULA, install ZIPs) — you download those from ServiceNow yourself,
 as described in §3.1 of the doc.
 
+For the narrative version of the same material, see the walkthrough:
+[part 1 — deploying the in-cluster MID Server](blog-part1-DRAFT.md) and
+[part 2 — the custom CI class and Discovery Pattern](blog-part2-DRAFT.md).
+
 ## Contents
 
 | File | Purpose |
@@ -27,6 +31,8 @@ as described in §3.1 of the doc.
 | `asset/import_ocp_service_ca.sh` | MID pod startup hook that trusts the OpenShift service-network CA. |
 | `snow-mid.yaml` | MID Server Secret + Deployment **template** (placeholder credentials). |
 | `Dockerfile` | The recipe Dockerfile with the §3.2.3 customizations applied. |
+| `blog-part1-DRAFT.md` | Blog draft, part 1: deploy a CA-trusted in-cluster MID Server. |
+| `blog-part2-DRAFT.md` | Blog draft, part 2: custom VM CI class, Discovery Pattern, schedule, verify. |
 | `images/` | Screenshots used by the walkthrough. |
 
 ## Credentials
